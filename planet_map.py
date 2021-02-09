@@ -22,6 +22,7 @@ parser.add_argument("--sim",           type=str,   default=None, help="Passing a
 parser.add_argument("--noiseless",      action="store_true", help="Replace signal with simulation instead of adding them. This can be used to get noise free transfer functions")
 parser.add_argument("--dbox",          type=str,   default=None, help="Select only detectors in y1:y2,x1:x2 in the focalplane, relative to the center of the array, in degrees.")
 parser.add_argument("--tags",          type=str,   default=None)
+parser.add_argument("--no-abscal",     action="store_true", help="Do not apply the per-TOD absolute calibration. The output maps will be uncalibrated (i.e. in units pW because the relative calibration is still applied). Used as input for the abscal pipeline.")
 args = parser.parse_args()
 
 zenith = args.zenith - args.equator
@@ -32,7 +33,8 @@ ids  = filedb.scans[args.sel]
 R    = args.dist * utils.degree
 csize= 100
 
-dtype= np.float32
+#dtype= np.float32
+dtype= np.float64
 area = enmap.read_map(filedb.get_patch_path(args.area)).astype(dtype)
 ncomp= 3
 shape= area.shape[-2:]
@@ -69,6 +71,19 @@ def broaden_beam_hor(tod, d, ibeam, obeam):
 	sigma = (obeam**2-ibeam**2)**0.5
 	ft *= np.exp(-0.5*(sigma/skyspeed)**2*k**2)
 	fft.ifft(ft, tod, normalize=True)
+
+def undo_abscal(data, entry, map, div, rhs):
+	''' Divide out the abscal from the input maps (inplace)'''
+	abscal = data.gain_correction[entry.tag]
+	if data.gain_mode == 'mce':
+		abscal /= data.mce_gain
+	elif data.gain_mode == 'mce_compat':
+		abscal /= data.mce_gain * 1217.8583043
+	else:
+		raise ValueError('gain_mode {} not understood'.format(data.gain_mode))
+	map /= abscal
+	rhs /= abscal
+	div /= (abscal ** 2)
 
 for ind in range(comm.rank, len(ids), comm.size):
 	id    = ids[ind]
@@ -107,6 +122,7 @@ for ind in range(comm.rank, len(ids), comm.size):
 	# Very simple white noise model. This breaks if the beam has been tod-smoothed by this point.
 	with bench.show("ivar"):
 		tod  = d.tod
+		print('id : {}, tod : {}'.format(id, tod))
 		del d.tod
 		tod -= np.mean(tod,1)[:,None]
 		tod  = tod.astype(dtype)
@@ -160,6 +176,9 @@ for ind in range(comm.rank, len(ids), comm.size):
 	with bench.show("map"):
 		idiv = array_ops.eigpow(div, -1, axes=[0,1], lim=1e-5, fallback="scalar")
 		map  = enmap.map_mul(idiv, rhs)
+	if args.no_abscal:
+		# Undo abscal after solving to avoid numerical instabilities.
+		undo_abscal(d, entry, map, div, rhs)
 	# Estimate central amplitude
 	c = np.array(map.shape[-2:])//2
 	crad  = 50
