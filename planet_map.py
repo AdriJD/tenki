@@ -6,6 +6,9 @@ from enlib import config, pmat, mpi, errors, gapfill, enmap, bench
 from enlib import fft, array_ops
 from enact import filedb, actscan, actdata, cuts, nmat_measure
 
+# NOTE
+fft.set_engine('fftw')
+
 config.set("pmat_cut_type",  "full")
 
 parser = config.ArgumentParser(os.environ["HOME"]+"./enkirc")
@@ -21,8 +24,10 @@ parser.add_argument("-c", "--cont",    action="store_true")
 parser.add_argument("--sim",           type=str,   default=None, help="Passing a sel here sets up simulation mode. The simulations will consist of data from the sim sel TODs with the scanning pattern of the real TODs, and with the signal read off from the area map")
 parser.add_argument("--noiseless",      action="store_true", help="Replace signal with simulation instead of adding them. This can be used to get noise free transfer functions")
 parser.add_argument("--dbox",          type=str,   default=None, help="Select only detectors in y1:y2,x1:x2 in the focalplane, relative to the center of the array, in degrees.")
-parser.add_argument("--tags",          type=str,   default=None)
+parser.add_argument("--tags",	       type=str,   default=None)
+parser.add_argument("--pol-family",    type=str,   default=None, help="Select only 'A' or 'B' detectors.")
 parser.add_argument("--no-abscal",     action="store_true", help="Do not apply the per-TOD absolute calibration. The output maps will be uncalibrated (i.e. in units pW because the relative calibration is still applied). Used as input for the abscal pipeline.")
+parser.add_argument("--no-pol",	    action="store_true", help="Only solve for total intensity")
 args = parser.parse_args()
 
 zenith = args.zenith - args.equator
@@ -33,10 +38,9 @@ ids  = filedb.scans[args.sel]
 R    = args.dist * utils.degree
 csize= 100
 
-#dtype= np.float32
 dtype= np.float64
+ncomp = 3
 area = enmap.read_map(filedb.get_patch_path(args.area)).astype(dtype)
-ncomp= 3
 shape= area.shape[-2:]
 model_fknee = 10
 model_alpha = 10
@@ -85,6 +89,24 @@ def undo_abscal(data, entry, map, div, rhs):
 	rhs /= abscal
 	div /= (abscal ** 2)
 
+def select_pol_family(data, pol_family):
+	'''
+	Only include detectors of certain polarization family.
+
+	Parameters
+	----------
+	data : Dataset object
+	    Uncalibrated dataset.
+	pol_family : str
+	    Only use detectors from this family, e.g. A or B.
+	'''
+	array_name = actdata.get_array_name(data.entry.id) # e.g. "pa7".
+	good_dets = data.array_info.info['det_uid'][data.array_info.info['pol_family'] == pol_family]
+	# Format like "paXX_0001" to match data.dets.
+	good_dets = np.asarray([array_name + '_{:04d}'.format(det) for det in good_dets])
+	good_dets = np.setdiff1d(data.dets, good_dets, assume_unique=True)
+	data.restrict(dets=good_dets)
+
 for ind in range(comm.rank, len(ids), comm.size):
 	id    = ids[ind]
 	bid   = id.replace(":","_")
@@ -105,6 +127,10 @@ for ind in range(comm.rank, len(ids), comm.size):
 			with bench.show("read"):
 				d  = actdata.read(entry, ["boresight"])
 				d += actdata.read(sim_entry, exclude=["boresight"])
+		if args.pol_family is not None:
+			with bench.show(f"Select pol_family : {args.pol_family}"):
+				ndet_tmp = d.ndet
+				select_pol_family(d, args.pol_family)
 		with bench.show("calibrate"):
 			d = actdata.calibrate(d, exclude=["autocut"])
 		if d.ndet == 0 or d.nsamp < 2: raise errors.DataMissing("no data in tod")
@@ -118,11 +144,9 @@ for ind in range(comm.rank, len(ids), comm.size):
 		print("Skipping %s (%s)" % (id, str(e)))
 		continue
 	print("Processing %s" % id, d.ndet, d.nsamp)
-	#broaden_beam_hor(d.tod, d, 1.35*utils.arcmin*utils.fwhm, 1.57*utils.arcmin*utils.fwhm)
 	# Very simple white noise model. This breaks if the beam has been tod-smoothed by this point.
 	with bench.show("ivar"):
 		tod  = d.tod
-		print('id : {}, tod : {}'.format(id, tod))
 		del d.tod
 		tod -= np.mean(tod,1)[:,None]
 		tod  = tod.astype(dtype)
@@ -174,11 +198,15 @@ for ind in range(comm.rank, len(ids), comm.size):
 			div[i] = 0
 			pmap.backward(tod, div[i])
 	with bench.show("map"):
+		if args.no_pol:
+			div = div[0:1,0:1]
+			rhs = rhs[0:1]			      
 		idiv = array_ops.eigpow(div, -1, axes=[0,1], lim=1e-5, fallback="scalar")
 		map  = enmap.map_mul(idiv, rhs)
 	if args.no_abscal:
-		# Undo abscal after solving to avoid numerical instabilities.
-		undo_abscal(d, entry, map, div, rhs)
+		with bench.show("Undoing abscal"):
+			# Undo abscal after solving to avoid numerical instabilities.
+			undo_abscal(d, entry, map, div, rhs)
 	# Estimate central amplitude
 	c = np.array(map.shape[-2:])//2
 	crad  = 50
