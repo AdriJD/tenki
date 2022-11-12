@@ -8,6 +8,8 @@ parser.add_argument("-a", "--allow-nonstandard",   action="store_true")
 parser.add_argument("-c", "--cont",                action="store_true")
 parser.add_argument("-d", "--dry",                 action="store_true")
 parser.add_argument("-O", "--output",    type=str, default="map,ivar,sens,xlink,hits,totmap,totsens,totxlink,tothits")
+parser.add_argument("--exclude",         type=str, default=None)
+parser.add_argument("--only",            type=str, default=None)
 args = parser.parse_args()
 import numpy as np, glob, re, os, shutil, sys
 from enlib import enmap, utils, retile, bunch, mpi
@@ -20,6 +22,8 @@ verbose = True
 datasets = {}
 for fname in glob.glob(args.idir + "/*map????.fits"):
 	fname = os.path.basename(fname)
+	if args.exclude and re.search(args.exclude, fname): continue
+	if args.only    and not re.search(args.only, fname): continue
 	m = re.search(r"^(.*)_(\d+)way_(\d+)_sky_map(\d\d\d\d).fits", fname)
 	if not m:
 		if comm.rank == 0: print("Skipping unrecognized map name: " + fname)
@@ -56,9 +60,11 @@ for key in sorted(datasets.keys()):
 	# Do we have any zeros at this point? If so, warn and skip the dataset
 	nzero = sum([sub.it == 0 for sub in d])
 	if nzero > 0:
-		if comm.rank == 0: print("%-*s only has %d/%d splits. Skipping" % (nchar, key, len(d)-nzero, len(d)))
+		if comm.rank == 0:
+			desc = " %4d"*len(d) % tuple([sub.it for sub in d])
+			print("%-*s with %s has only %d/%d splits. Skipping" % (nchar, key, desc, len(d)-nzero, len(d)))
 		del datasets[key]
-	if comm.rank == 0:
+	elif comm.rank == 0:
 		print("%-*s using" % (nchar, key) + " %4d"*len(d) % tuple([sub.it for sub in d]))
 
 # Check if we follow the standard format
@@ -215,6 +221,11 @@ for iname in sorted(datasets.keys()):
 					copy_mono(idiv, ovar, slice=".preflat[0]")
 					#link(ovar, ovar_srcfree)
 				schedule(foo, ipre + "sky_div.fits", opre + "ivar.fits", opre + "ivar_srcfree.fits")
+			if "div" in outputs:
+				def foo(idiv, odiv, odiv_srcfree):
+					copy_mono(idiv, odiv)
+					#link(ovar, ovar_srcfree)
+				schedule(foo, ipre + "sky_div.fits", opre + "div.fits", opre + "div_srcfree.fits")
 		else:
 			if not has_srcs:
 				schedule(combine_srcmaps, [ipre + "sky_map%04d.fits" % sub.it], [ipre + "sky_srcmap.fits"],

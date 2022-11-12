@@ -21,7 +21,7 @@ if len(sys.argv) < 2:
 mode = sys.argv[1]
 
 parser = argparse.ArgumentParser(description=help_general)
-parser.add_argument("mode", choices=["find","fit","subtract","dedup"])
+parser.add_argument("mode", choices=["find","fit","subtract","subtract_nompi"])
 if mode == "find":
 	parser.add_argument("imap", help="The map to find sources in. Should be enmap-compatible.")
 	parser.add_argument("idiv", help="The inverse variance per pixel of imap.")
@@ -31,7 +31,7 @@ elif mode == "fit":
 	parser.add_argument("idiv", help="The inverse variance per pixel of imap.")
 	parser.add_argument("icat", help="The input point source catalog for amplitude fitting.")
 	parser.add_argument("odir", help="The directory to write the output to. Will be crated if necessary.")
-elif mode == "subtract":
+elif mode == "subtract" or mode == "subtract_nompi":
 	parser.add_argument("imap", help="The map to subtract sources from. Should be enmap-compatible.")
 	parser.add_argument("icat", help="The catalog of sources to be subtracted.")
 	parser.add_argument("omap", help="The resulting source-subtracted map")
@@ -45,6 +45,7 @@ parser.add_argument(      "--rsplit",  type=int,   default=0,  help="Split regio
 parser.add_argument("-a", "--apod",    type=int,   default=30, help="The width of the apodization region, in pixels.")
 parser.add_argument("--apod-margin",   type=int,   default=10, help="How far away from the apod region a source should be to be valid.")
 parser.add_argument("-s", "--nsigma",  type=float, default=None, help="The number a sigma a source must be to be included. Defaults to 3.5 when finding sources and None when fitting and subtracting")
+parser.add_argument("-S", "--status",  type=int, default=None, help="Only subtract point sources with this status. Only applies to dory subtract.")
 parser.add_argument("-p", "--pad",     type=int,   default=60, help="The number of pixels to extend each region by in each direciton, to avoid losing sources at region boundaries. Should be larger than apod+apod_margin")
 parser.add_argument("-P", "--prior",   type=float, default=1.0, help="The strength of the input prior in fit mode. Actually the inverse of the source variability assumed, so 0 means the source will be assumed to be infinitely variable, and hence the input database amplitudes don't add anything to the new fit. infinity means that the source is completley stable, and the input statistics add in inverse variance to the measurements. The default is 1, which means that the input database contributes only at the 1 sigma level")
 parser.add_argument("-v", "--verbose", action="store_true")
@@ -57,6 +58,11 @@ parser.add_argument(      "--split",   action="store_true")
 parser.add_argument(      "--split-nimage", type=int,   default=16)
 parser.add_argument(      "--split-dist",   type=float, default=1)
 parser.add_argument(      "--split-minflux",type=float, default=300)
+parser.add_argument(      "--rmax",    type=float, default=None)
+parser.add_argument(      "--lknee",   type=float, default=None)
+parser.add_argument(      "--npass",   type=int,   default=2)
+parser.add_argument(      "--vmin",    type=float, default=0.01, help="Only simulate srcs out to this value in uK")
+parser.add_argument("-c", "--cont",    action="store_true")
 
 args = parser.parse_args()
 import numpy as np, os
@@ -66,6 +72,7 @@ from enlib import enmap, utils, bunch, mpi, fft, pointsrcs
 comm       = mpi.COMM_WORLD
 shape, wcs = enmap.read_map_geometry(args.imap)
 beam       = dory.get_beam(args.beam)
+beam       = utils.regularize_beam(beam, nl=40000)
 regions    = dory.get_regions(args.regions, shape, wcs)
 if args.rsplit:
 	regions = dory.split_regions(regions, args.rsplit)
@@ -171,6 +178,10 @@ elif args.mode == "fit":
 	utils.mkdir(args.odir)
 	write_args(args.odir + "/args.txt")
 	for ri in range(comm.rank, len(regions), comm.size):
+		prefix = args.odir + "/region_%02d_" % ri
+		if args.cont and os.path.isfile(prefix + "cat.fits"):
+			reg_cats.append(dory.read_catalog(prefix + "cat.fits"))
+			continue
 		reg_fid = regions[ri]
 		reg_pad = dory.pad_region(reg_fid, args.pad, fft=True)
 		print("%3d region %3d/%d %5d %5d %6d %6d" % (comm.rank, ri+1, len(regions), reg_fid[0,0], reg_fid[1,0], reg_fid[0,1], reg_fid[1,1]))
@@ -200,9 +211,12 @@ elif args.mode == "fit":
 				# Build an amplitude prior from our input catalog fluxes
 				prior    = dory.build_prior(icat.flux[:,ci]/fluxconv, icat.dflux[:,ci]/fluxconv, 1/args.prior)
 				src_pos  = np.array([icat.dec,icat.ra]).T
-				fit_inds, amp, icov, lamps = dory.fit_src_amps(imap[ci], get_div(idiv,ci), src_pos, beam, prior=prior,
-						apod=args.apod, apod_margin=args.apod_margin, verbose=args.verbose, dump=dump_prefix, hack=args.hack,
-						region=ri)
+				try:
+					fit_inds, amp, icov, lamps = dory.fit_src_amps(imap[ci], get_div(idiv,ci), src_pos, beam, prior=prior,
+							apod=args.apod, apod_margin=args.apod_margin, verbose=args.verbose, dump=dump_prefix, hack=args.hack,
+							region=ri, lknee=args.lknee, npass=args.npass)
+				except dory.FitError as e:
+					fit_inds, amp, icov, lamps = np.zeros([0],int), np.zeros([0]), np.zeros([0,0]), np.zeros([0])
 				if reg_cat is None:
 					reg_cat = icat[fit_inds].copy()
 					reg_cat.amp = reg_cat.damp = reg_cat.flux = reg_cat.dflux = 0
@@ -220,7 +234,6 @@ elif args.mode == "fit":
 			reg_cat = reg_cat[np.argsort(reg_cat.amp[:,0]/reg_cat.damp[:,0])[::-1]]
 			# Write region output
 			if "reg" in args.output:
-				prefix = args.odir + "/region_%02d_" % ri
 				dory.write_catalog_fits(prefix + "cat.fits", reg_cat)
 				dory.write_catalog_txt (prefix + "cat.txt",  reg_cat)
 			if "full" in args.output:
@@ -243,10 +256,13 @@ elif args.mode == "fit":
 			dory.write_catalog_txt (args.odir + "/cat.txt",  tot_cat)
 elif args.mode == "subtract":
 	icat      = dory.read_catalog(args.icat)
+	if args.status is not None:
+		icat = icat[icat.status == args.status]
 	if args.nsigma is not None:
 		icat  = icat[icat.flux[:,0] >= icat.dflux[:,0]*args.nsigma]
 	beam_prof = dory.get_beam_profile(beam)
 	barea     = dory.calc_beam_profile_area(beam_prof)
+	rmax      = args.rmax*utils.arcmin if args.rmax is not None else None
 	#print "subtract barea: %8.3f" % (barea*1e9)
 	fluxconv  = utils.flux_factor(barea, args.freq*1e9)/1e6
 	# Reformat the catalog to the format sim_srcs takes
@@ -261,7 +277,7 @@ elif args.mode == "subtract":
 		print("%3d region %3d/%d %5d %5d %6d %6d" % (comm.rank, ri+1, len(regions), reg_fid[0,0], reg_fid[1,0], reg_fid[0,1], reg_fid[1,1]))
 		map    = enmap.read_map(args.imap, pixbox=reg_pad)
 		map    = work_around_stupid_mpi4py_bug(map)
-		model  = pointsrcs.sim_srcs(map.shape, map.wcs, srcs, beam_prof, dtype=map.dtype, pixwin=True,verbose=args.verbose)
+		model  = pointsrcs.sim_srcs(map.shape, map.wcs, srcs, beam_prof, dtype=map.dtype, pixwin=True,verbose=args.verbose, rmax=rmax, vmin=args.vmin)
 		model[map==0] = 0
 		omaps.append(map-model)
 		if args.omodel: models.append(model)
@@ -278,4 +294,29 @@ elif args.mode == "subtract":
 		del models
 		if comm.rank == 0: print("Writing model")
 		if comm.rank == 0: enmap.write_map(args.omodel, model)
+		del model
+elif args.mode == "subtract_nompi":
+	icat      = dory.read_catalog(args.icat)
+	if args.status is not None:
+		icat = icat[icat.status == args.status]
+	if args.nsigma is not None:
+		icat  = icat[icat.flux[:,0] >= icat.dflux[:,0]*args.nsigma]
+	beam_prof = dory.get_beam_profile(beam)
+	barea     = dory.calc_beam_profile_area(beam_prof)
+	print("barea: %15.7e" % barea)
+	rmax      = args.rmax*utils.arcmin if args.rmax is not None else None
+	fluxconv  = utils.flux_factor(barea, args.freq*1e9)/1e6
+	# Reformat the catalog to the format sim_srcs takes
+	srcs   = np.concatenate([[icat.dec, icat.ra], icat.flux.T/fluxconv],0).T
+	print("Reading %s" % args.imap)
+	map    = enmap.read_map(args.imap)
+	print("Subtracting")
+	model  = pointsrcs.sim_srcs(map.shape, map.wcs, srcs, beam_prof, dtype=map.dtype, pixwin=True, verbose=args.verbose, rmax=rmax, vmin=args.vmin)
+	map   -= model
+	print("Writing map")
+	enmap.write_map(args.omap, map)
+	del map
+	if args.omodel:
+		print("Writing model")
+		enmap.write_map(args.omodel, model)
 		del model

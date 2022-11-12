@@ -2,7 +2,7 @@ from __future__ import division, print_function
 import numpy as np, sys, os
 from enlib import utils
 with utils.nowarn(): import h5py
-from enlib import config, pmat, mpi, errors, gapfill, enmap, bench
+from enlib import config, pmat, mpi, errors, gapfill, enmap, bench, sampcut, cg
 from enlib import fft, array_ops
 from enact import filedb, actscan, actdata, cuts, nmat_measure
 
@@ -32,6 +32,8 @@ parser.add_argument("--detset",	type=str, help="Absolute path to detset file. Sh
 parser.add_argument("--no-div",	    action="store_true", help="Do not store div maps.")
 parser.add_argument("--no-rhs",	    action="store_true", help="Do not store rhs maps.")
 parser.add_argument("--equ",	    action="store_true", help="Map in coordinate system with cross-linking.")
+parser.add_argument("-m", "--model",   type=str,   default="joneig")
+
 args = parser.parse_args()
 
 zenith = args.zenith - args.equator
@@ -48,11 +50,13 @@ area = enmap.read_map(filedb.get_patch_path(args.area)).astype(dtype)
 shape= area.shape[-2:]
 model_fknee = 10
 model_alpha = 10
+
 if args.equ:
 	sys = "equ:"+args.planet
 else:
 	sys = "hor:"+args.planet
 if not zenith: sys += "/0_0"
+
 utils.mkdir(args.odir)
 prefix = args.odir + "/"
 if args.tag:  prefix += args.tag + "_"
@@ -136,6 +140,34 @@ def read_detset(fname, entry):
 	flags = np.loadtxt(fname, usecols=1, dtype=bool)
 	return [f'pa{pa}_{det_id}' for det_id in det_ids[flags]]
 
+def calc_model_joneig(tod, cut, srate=400):
+	return smooth(gapfill.gapfill_joneig(tod, cut, inplace=False), srate)
+
+def calc_model_constrained(tod, cut, srate=400, mask_scale=0.3, lim=3e-4, maxiter=50, verbose=False):
+	# First do some simple gapfilling to avoid messing up the noise model
+	tod = sampcut.gapfill_linear(cut, tod, inplace=False)
+	ft = fft.rfft(tod) * tod.shape[1]**-0.5
+	iN = nmat_measure.detvecs_jon(ft, srate)
+	del ft
+	iV = iN.ivar*mask_scale
+	def A(x):
+		x   = x.reshape(tod.shape)
+		Ax  = iN.apply(x.copy())
+		Ax += sampcut.gapfill_const(cut, x*iV[:,None], 0, inplace=True)
+		return Ax.reshape(-1)
+	b  = sampcut.gapfill_const(cut, tod*iV[:,None], 0, inplace=True).reshape(-1)
+	x0 = sampcut.gapfill_linear(cut, tod).reshape(-1)
+	solver = cg.CG(A, b, x0)
+	while solver.i < maxiter and solver.err > lim:
+		solver.step()
+		if verbose:
+			print("%5d %15.7e" % (solver.i, solver.err))
+	res = solver.x.reshape(tod.shape)
+	res = smooth(res, srate)
+	return res
+
+calc_model = {"joneig": calc_model_joneig, "constrained": calc_model_constrained}[args.model]
+
 for ind in range(comm.rank, len(ids), comm.size):
 	id    = ids[ind]
 	bid   = id.replace(":","_")
@@ -170,6 +202,7 @@ for ind in range(comm.rank, len(ids), comm.size):
 			off  = d.point_template-mid
 			good = np.all((off > dbox[0])&(off < dbox[1]),-1)
 			d    = d.restrict(dets=d.dets[good])
+		if d.ndet == 0 or d.nsamp < 2: raise errors.DataMissing("No data left")
 	except errors.DataMissing as e:
 		print("Skipping %s (%s)" % (id, str(e)))
 		continue
@@ -204,9 +237,9 @@ for ind in range(comm.rank, len(ids), comm.size):
 			pmap.forward(tod, area)
 	# Compute atmospheric model
 	with bench.show("atm model"):
-		model  = smooth(gapfill.gapfill_joneig(tod,	 planet_cut, inplace=False), d.srate)
+		model  = calc_model(tod, planet_cut, d.srate)
 	if args.sim and args.noiseless:
-		model -= smooth(gapfill.gapfill_joneig(tod_orig, planet_cut, inplace=False), d.srate)
+		model -= calc_model(tod_orig, planet_cut, d.srate)
 		tod   -= tod_orig
 		del tod_orig
 	with bench.show("atm subtract"):
