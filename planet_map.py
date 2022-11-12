@@ -21,13 +21,17 @@ parser.add_argument("-R", "--dist",    type=float, default=0.2)
 parser.add_argument("-e", "--equator", action="count", default=0)
 parser.add_argument("-z", "--zenith",  action="count", default=0)
 parser.add_argument("-c", "--cont",    action="store_true")
-parser.add_argument("--sim",           type=str,   default=None, help="Passing a sel here sets up simulation mode. The simulations will consist of data from the sim sel TODs with the scanning pattern of the real TODs, and with the signal read off from the area map")
-parser.add_argument("--noiseless",      action="store_true", help="Replace signal with simulation instead of adding them. This can be used to get noise free transfer functions")
-parser.add_argument("--dbox",          type=str,   default=None, help="Select only detectors in y1:y2,x1:x2 in the focalplane, relative to the center of the array, in degrees.")
+parser.add_argument("--sim",	       type=str,   default=None, help="Passing a sel here sets up simulation mode. The simulations will consist of data from the sim sel TODs with the scanning pattern of the real TODs, and with the signal read off from the area map")
+parser.add_argument("--noiseless",	action="store_true", help="Replace signal with simulation instead of adding them. This can be used to get noise free transfer functions")
+parser.add_argument("--dbox",	       type=str,   default=None, help="Select only detectors in y1:y2,x1:x2 in the focalplane, relative to the center of the array, in degrees.")
 parser.add_argument("--tags",	       type=str,   default=None)
 parser.add_argument("--pol-family",    type=str,   default=None, help="Select only 'A' or 'B' detectors.")
 parser.add_argument("--no-abscal",     action="store_true", help="Do not apply the per-TOD absolute calibration. The output maps will be uncalibrated (i.e. in units pW because the relative calibration is still applied). Used as input for the abscal pipeline.")
 parser.add_argument("--no-pol",	    action="store_true", help="Only solve for total intensity")
+parser.add_argument("--detset",	type=str, help="Absolute path to detset file. Should be .txt file with detector ids as first column and {0, 1} flag in second column.")
+parser.add_argument("--no-div",	    action="store_true", help="Do not store div maps.")
+parser.add_argument("--no-rhs",	    action="store_true", help="Do not store rhs maps.")
+parser.add_argument("--equ",	    action="store_true", help="Map in coordinate system with cross-linking.")
 args = parser.parse_args()
 
 zenith = args.zenith - args.equator
@@ -44,7 +48,10 @@ area = enmap.read_map(filedb.get_patch_path(args.area)).astype(dtype)
 shape= area.shape[-2:]
 model_fknee = 10
 model_alpha = 10
-sys = "hor:"+args.planet
+if args.equ:
+	sys = "equ:"+args.planet
+else:
+	sys = "hor:"+args.planet
 if not zenith: sys += "/0_0"
 utils.mkdir(args.odir)
 prefix = args.odir + "/"
@@ -107,6 +114,28 @@ def select_pol_family(data, pol_family):
 	good_dets = np.setdiff1d(data.dets, good_dets, assume_unique=True)
 	data.restrict(dets=good_dets)
 
+def read_detset(fname, entry):
+	'''
+	Read and process detectorset file.
+
+	Arguments
+	---------
+	fname : str
+	    Absolute path to detset file. Should be .txt file with
+	    detector ids as first column and {0, 1} flag in second column.
+	entry : pixell.bunch.Bunch object
+	    TOD entry.
+
+	Returns
+	-------
+	dets : (ndet) list
+	    List with detectors ids, e.g. ['pa5_12', 'pa5_253'].
+	'''
+	pa = entry.id[-1]
+	det_ids = np.loadtxt(fname, usecols=0, dtype=int)
+	flags = np.loadtxt(fname, usecols=1, dtype=bool)
+	return [f'pa{pa}_{det_id}' for det_id in det_ids[flags]]
+
 for ind in range(comm.rank, len(ids), comm.size):
 	id    = ids[ind]
 	bid   = id.replace(":","_")
@@ -117,16 +146,17 @@ for ind in range(comm.rank, len(ids), comm.size):
 		print("Skipping %s (already done)" % (id))
 		continue
 	# Read the tod as usual
+	dets = read_detset(args.detset, entry) if args.detset else None
 	try:
 		if not args.sim:
 			with bench.show("read"):
-				d = actdata.read(entry)
+				d = actdata.read(entry, dets=dets)
 		else:
-			sim_id    = sim_ids[ind]
+			sim_id	  = sim_ids[ind]
 			sim_entry = filedb.data[sim_id]
 			with bench.show("read"):
-				d  = actdata.read(entry, ["boresight"])
-				d += actdata.read(sim_entry, exclude=["boresight"])
+				d  = actdata.read(entry, ["boresight"], dets=dets)
+				d += actdata.read(sim_entry, exclude=["boresight"], dets=dets)
 		if args.pol_family is not None:
 			with bench.show(f"Select pol_family : {args.pol_family}"):
 				ndet_tmp = d.ndet
@@ -174,7 +204,7 @@ for ind in range(comm.rank, len(ids), comm.size):
 			pmap.forward(tod, area)
 	# Compute atmospheric model
 	with bench.show("atm model"):
-		model  = smooth(gapfill.gapfill_joneig(tod,      planet_cut, inplace=False), d.srate)
+		model  = smooth(gapfill.gapfill_joneig(tod,	 planet_cut, inplace=False), d.srate)
 	if args.sim and args.noiseless:
 		model -= smooth(gapfill.gapfill_joneig(tod_orig, planet_cut, inplace=False), d.srate)
 		tod   -= tod_orig
@@ -215,7 +245,11 @@ for ind in range(comm.rank, len(ids), comm.size):
 	amp   = np.max(mcent)
 	print("%s amp %7.3f asens %7.3f" % (id, amp/1e6, asens))
 	with bench.show("write"):
+		np.savetxt("%s%s_stats.txt" % (prefix, bid), np.asarray([[amp, asens]]),
+			   header='amp, asens')
 		enmap.write_map("%s%s_map.fits" % (prefix, bid), map)
-		enmap.write_map("%s%s_rhs.fits" % (prefix, bid), rhs)
-		enmap.write_map("%s%s_div.fits" % (prefix, bid), div)
+		if not args.no_rhs:
+			enmap.write_map("%s%s_rhs.fits" % (prefix, bid), rhs)
+		if not args.no_div:
+			enmap.write_map("%s%s_div.fits" % (prefix, bid), div)
 	del d, scan, pmap, pcut, tod, map, rhs, div, idiv, junk
