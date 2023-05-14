@@ -22,6 +22,8 @@ parser.add_argument("-e", "--equator", action="count", default=0)
 parser.add_argument("-z", "--zenith",  action="count", default=0)
 parser.add_argument("-c", "--cont",    action="store_true")
 parser.add_argument("--sim",	       type=str,   default=None, help="Passing a sel here sets up simulation mode. The simulations will consist of data from the sim sel TODs with the scanning pattern of the real TODs, and with the signal read off from the area map")
+parser.add_argument("--sim-point-sigma", default=None, type=float, help="Shift input simulation map by random Gaussian offset with this standard deviation in arcmin")
+parser.add_argument("--sim-point-seed", default=None, type=int, help="Random seed for random point offset number generator")
 parser.add_argument("--noiseless",	action="store_true", help="Replace signal with simulation instead of adding them. This can be used to get noise free transfer functions")
 parser.add_argument("--dbox",	       type=str,   default=None, help="Select only detectors in y1:y2,x1:x2 in the focalplane, relative to the center of the array, in degrees.")
 parser.add_argument("--tags",	       type=str,   default=None)
@@ -69,6 +71,11 @@ if args.sim:
 		tmp = enmap.zeros((ncomp,)+shape, area.wcs, dtype)
 		tmp[0] = area
 		area = tmp
+
+	if args.sim_point_sigma:
+		seedseq = np.random.SeedSequence(args.sim_point_seed)
+		child_seeds = seedseq.spawn(len(ids))
+		streams = [np.random.default_rng(s) for s in child_seeds]
 
 def smooth(tod, srate):
 	ft   = fft.rfft(tod)
@@ -166,6 +173,28 @@ def calc_model_constrained(tod, cut, srate=400, mask_scale=0.3, lim=3e-4, maxite
 	res = smooth(res, srate)
 	return res
 
+def shift_map(imap, offset):
+	'''
+	Shift input map, simulating a pointing error.
+	
+	Parameters
+	----------
+	imap : (..., ny, nx) enmap
+	    Input map.
+	offset : (2,) array
+	    Shift in Y direction and X direction in arcmin.
+
+	Returns
+	-------
+	omap : (..., ny, nx) enmap
+	    Copy of input map that has been shifted. Same WCS as input map.
+	'''
+
+	offset = np.asarray(offset) / 60
+	offset_pix = offset / imap.wcs.wcs.cdelt[::-1]
+	omap = enmap.fractional_shift(imap, offset_pix, keepwcs=True, nofft=False)
+	return enmap.samewcs(np.ascontiguousarray(omap), imap)
+
 calc_model = {"joneig": calc_model_joneig, "constrained": calc_model_constrained}[args.model]
 
 for ind in range(comm.rank, len(ids), comm.size):
@@ -177,6 +206,8 @@ for ind in range(comm.rank, len(ids), comm.size):
 	if args.cont and os.path.isfile(oname):
 		print("Skipping %s (already done)" % (id))
 		continue
+	if args.sim_point_sigma:
+		rng = streams[ind]
 	# Read the tod as usual
 	dets = read_detset(args.detset, entry) if args.detset else None
 	try:
@@ -234,7 +265,12 @@ for ind in range(comm.rank, len(ids), comm.size):
 	if args.sim:
 		if args.noiseless: tod_orig = tod.copy()
 		with bench.show("inject"):
-			pmap.forward(tod, area)
+			if args.sim_point_sigma:
+				area_sim = shift_map(area, 
+				    rng.normal(scale=args.sim_point_sigma, size=2))
+			else:
+				area_sim = area
+			pmap.forward(tod, area_sim)
 	# Compute atmospheric model
 	with bench.show("atm model"):
 		model  = calc_model(tod, planet_cut, d.srate)
