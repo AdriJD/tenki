@@ -15,6 +15,7 @@ parser.add_argument("-c", "--cont",    action="store_true")
 parser.add_argument(      "--simple",  action="store_true")
 parser.add_argument(      "--simple-lknee", type=float, default=1000)
 parser.add_argument(      "--simple-alpha", type=float, default=-3.5)
+parser.add_argument(      "--noisemask-lim",type=float, default=None)
 args = parser.parse_args()
 import numpy as np
 from pixell import enmap, utils, bunch, mpi, uharm, array_ops, analysis
@@ -175,7 +176,8 @@ for fi in range(comm.rank, nfile, comm.size):
 	# Read in our data
 	map  = enmap.read_map(mapfile)  * fconv
 	ivar = enmap.read_map(ivarfile) / fconv**2
-	info = bunch.read(infofile)
+	if args.shift > 0:
+		info = bunch.read(infofile)
 	dtype  = map.dtype
 	ny, nx = map.shape[-2:]
 	# Build our shift matrix
@@ -189,10 +191,19 @@ for fi in range(comm.rank, nfile, comm.size):
 	# Apodize the edge by decreasing the significance in ivar
 	noise_apod = enmap.apod_mask(hit, apod_edge)
 	# Check if we have a noise model mask too
+	mask = 0
 	if args.mask:
-		mask        = enmap.read_map(args.mask, geometry=map.geometry)
+		mask |= enmap.read_map(args.mask, geometry=map.geometry)
+	# Optionally mask very bright regions
+	if args.noisemask_lim:
+		bright= np.abs(map.preflat[0] < args.noisemask_lim * fconv)
+		rmask = 5*utils.arcmin
+		mask |= bright.distance_transform(rmax=rmask) < rmask
+		del bright
+	mask = np.asanyarray(mask)
+	if mask.size > 0 and mask.ndim > 0:
 		noise_apod *= enmap.apod_mask(1-mask, apod_holes)
-		del mask
+	del mask
 	# Build the noise model
 	iC  = build_ips2d_udgrade(S.forward(map), S.forward(ivar*noise_apod), apod_corr=np.mean(noise_apod**2), lres=lres)
 	del noise_apod
