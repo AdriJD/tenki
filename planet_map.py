@@ -12,7 +12,7 @@ fft.set_engine('fftw')
 config.set("pmat_cut_type",  "full")
 
 parser = config.ArgumentParser(os.environ["HOME"]+"./enkirc")
-parser.add_argument("planet")
+parser.add_argument("planet", help="E.g, 'Uranus', can also by RA, DEC string in degrees, e.g. '83.63322, 22.01446' for Tau_A.")
 parser.add_argument("area")
 parser.add_argument("sel")
 parser.add_argument("odir")
@@ -53,10 +53,17 @@ shape= area.shape[-2:]
 model_fknee = 10
 model_alpha = 10
 
+try:
+	planet = np.radians(utils.parse_floats(args.planet))
+	planet_str = f'{np.degrees(planet[0]):.6f}_{np.degrees(planet[1]):.6f}'
+except ValueError:
+	planet = args.planet
+	planet_str = planet
+
 if args.equ:
-	sys = "equ:"+args.planet
+	sys = "equ:"+planet_str
 else:
-	sys = "hor:"+args.planet
+	sys = "hor:"+planet_str
 if not zenith: sys += "/0_0"
 
 utils.mkdir(args.odir)
@@ -261,7 +268,7 @@ for ind in range(comm.rank, len(ids), comm.size):
 	# Generate planet cut
 	with bench.show("planet cut"):
 		planet_cut = cuts.avoidance_cut(d.boresight, d.point_offset, d.site,
-				args.planet, R)
+				planet, R)
 	if args.sim:
 		if args.noiseless: tod_orig = tod.copy()
 		with bench.show("inject"):

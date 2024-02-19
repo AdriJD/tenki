@@ -880,7 +880,11 @@ for out_ind in range(nouter):
 				mask = enmap.read_map(param["mask"]) == 0
 			else: mask = None
 			if param["prec"] == "bin":
-				signal.precon = mapmaking.PreconMapBinned(prec_signal, myscans, weights, mask=mask)
+				if mask is None:
+					# HACK, remove when enlib is updated.
+					signal.precon = mapmaking.PreconMapBinned(prec_signal, myscans, weights)
+				else:
+					signal.precon = mapmaking.PreconMapBinned(prec_signal, myscans, weights, mask=mask)
 			elif param["prec"] == "jacobi":
 				signal.precon = mapmaking.PreconMapBinned(prec_signal, myscans, weights, noise=False, mask=mask)
 			elif param["prec"] == "hit":
