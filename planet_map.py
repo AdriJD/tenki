@@ -35,6 +35,7 @@ parser.add_argument("--no-div",	    action="store_true", help="Do not store div 
 parser.add_argument("--no-rhs",	    action="store_true", help="Do not store rhs maps.")
 parser.add_argument("--equ",	    action="store_true", help="Map in coordinate system with cross-linking.")
 parser.add_argument("-m", "--model",   type=str,   default="joneig")
+parser.add_argument("--subtract-buddies", action='store_true', help="Subtract the buddy sidelobes")
 
 args = parser.parse_args()
 
@@ -262,6 +263,10 @@ for ind in range(comm.rank, len(ids), comm.size):
 	with bench.show("pmat"):
 		pmap = pmat.PmatMap(scan, area, sys=sys)
 		pcut = pmat.PmatCut(scan)
+		if args.subtract_buddies:
+			pmat_buddy = pmat.PmatMapMultibeam(
+				scan, area, scan.buddy_offs,
+				scan.buddy_comps, order=0, sys=sys)
 		rhs  = enmap.zeros((ncomp,)+shape, area.wcs, dtype)
 		div  = enmap.zeros((ncomp,ncomp)+shape, area.wcs, dtype)
 		junk = np.zeros(pcut.njunk, dtype)
@@ -292,23 +297,39 @@ for ind in range(comm.rank, len(ids), comm.size):
 	# Should now be reasonably clean of correlated noise.
 	# Proceed to make simple binned map
 	with bench.show("rhs"):
+		tod_orig = tod.copy()
 		tod *= ivar[:,None]
 		pcut.backward(tod, junk)
 		pmap.backward(tod, rhs)
+		#if args.subtract_buddies:
+		#	pmat_buddy.backward(tod, rhs, mmul=+1, tmul=-1)
 	with bench.show("hits"):
 		for i in range(ncomp):
 			div[i,i] = 1
 			pmap.forward(tod, div[i])
+			#if args.subtract_buddies:
+			#	pmat_buddy.forward(tod, div[i], tmul=1)
 			tod *= ivar[:,None]
 			pcut.backward(tod, junk)
 			div[i] = 0
 			pmap.backward(tod, div[i])
+			#if args.subtract_buddies:
+			#	pmat_buddy.backward(tod, div[i], tmul=-1)
 	with bench.show("map"):
 		if args.no_pol:
 			div = div[0:1,0:1]
 			rhs = rhs[0:1]			      
 		idiv = array_ops.eigpow(div, -1, axes=[0,1], lim=1e-5, fallback="scalar")
 		map  = enmap.map_mul(idiv, rhs)
+	if args.subtract_buddies:
+		with bench.show("Buddy subtraction"):
+			pmat_buddy.forward(tod_orig, map, tmul=1, mmul=-1)
+			tod_orig *= ivar[:,None]
+			pcut.backward(tod_orig, junk)
+			rhs *= 0
+			pmap.backward(tod_orig, rhs)
+			map  = enmap.map_mul(idiv, rhs)
+ 
 	if args.no_abscal:
 		with bench.show("Undoing abscal"):
 			# Undo abscal after solving to avoid numerical instabilities.
