@@ -37,8 +37,9 @@ parser.add_argument(      "--srcsub", action="store_true")
 parser.add_argument(      "--minpass",type=int,   default=1)
 parser.add_argument(      "--downpat",type=str, default=None)
 parser.add_argument(      "--cgpat",  type=str, default="200")
-parser.add_argument(      "--distributed", type=int, default=-1)
-parser.add_argument(      "--account",type=str, default=None)
+parser.add_argument(	  "--distributed", type=int, default=-1)
+parser.add_argument(	  "--account",type=str, default=None)
+parser.add_argument(	  "--env",   type=str, default=None)
 args, unknown = parser.parse_known_args()
 from enlib import utils, config, enmap, colors
 
@@ -289,6 +290,8 @@ for toks in utils.list_combination_iter(alts):
 				deps.append("afterok:%d" % prev_jobid)
 			if len(deps) > 0:
 				slurm_command += "#SBATCH --dependency=" + ",".join(deps) + "\n"
+			if args.env:
+				slurm_command += args.env + "\n"
 			# Construct the full batch script
 			batch = """#!/bin/bash
 %(slurm)s
